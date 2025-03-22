@@ -1,5 +1,5 @@
 # Android-Archiver
-Windows application that helps you copy files from your Android device to your computer.
+Windows application that helps you copy files from your Android device to your computer. Much faster than using Windows File Explorer.
 
 ## Features
 - Backup entire /sdcard directory from Android device
