@@ -1,6 +1,10 @@
 # Android-Archiver
 Windows application that helps you copy files from your Android device to your computer. Much faster than using Windows File Explorer.
 
+[![License](https://img.shields.io/github/license/mirbyte/Android-Archiver?color=34A853&maxAge=604800)](https://raw.githubusercontent.com/mirbyte/Android-Archiver/master/LICENSE)
+![Size](https://img.shields.io/github/repo-size/mirbyte/Android-Archiver?label=size&color=34A853&maxAge=86400)
+![Last Commit](https://img.shields.io/github/last-commit/mirbyte/Android-Archiver?color=34A853&label=repo+updated)
+
 ## Features
 - Backup entire /sdcard directory from Android device
 - Windows executable (no Python installation required)
