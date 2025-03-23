@@ -25,7 +25,7 @@ Windows application that helps you copy files from your Android device to your c
 - Android device with USB debugging enabled
 
 ## Disclaimer
-The author of this software is not responsible for any data loss, device damage, or other issues that may occur while using this application. Use this software at your own risk.
+The author of this software is not responsible for any data loss, device damage, or other issues that may occur while using this application. Use this at your own risk.
 
 
 ![aa](https://github.com/user-attachments/assets/9e265b7f-0788-44d4-ae6d-53300605ee25)
