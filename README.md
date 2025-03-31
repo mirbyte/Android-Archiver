@@ -28,5 +28,9 @@ Windows application that helps you copy files from your Android device to your c
 The author of this software is not responsible for any data loss, device damage, or other issues that may occur while using this application. Use this at your own risk.
 
 
-![aa](https://github.com/user-attachments/assets/9e265b7f-0788-44d4-ae6d-53300605ee25)
+
+
+![v1 1](https://github.com/user-attachments/assets/50bcf297-c505-43f0-aff6-9bd810766ba0)
+
+
 
