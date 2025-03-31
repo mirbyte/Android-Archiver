@@ -1,5 +1,5 @@
 # Android-Archiver
-Windows application that helps you copy files from your Android device to your computer. Much faster than using Windows File Explorer. If you found this useful, please drop a ⭐- it means a lot!
+Windows application that helps you copy files from your Android device to your computer. Much faster than using Windows File Explorer. Android Platform Tools are official and unmodified. If you found this useful, please drop a ⭐- it means a lot!
 
 [![License](https://img.shields.io/github/license/mirbyte/Android-Archiver?color=34A853&maxAge=604800)](https://raw.githubusercontent.com/mirbyte/Android-Archiver/master/LICENSE)
 ![Size](https://img.shields.io/github/repo-size/mirbyte/Android-Archiver?label=size&color=34A853&maxAge=86400)
