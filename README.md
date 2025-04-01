@@ -9,6 +9,9 @@ Windows application that helps you copy files from your Android device to your c
 - Backup entire /sdcard directory from Android device
 - Windows executable (no Python installation required)
 
+**Known issues**
+- elapsed time not calculated correctly
+
 ## Installation
 1. Download the project zip
 2. Unzip and run the .exe
