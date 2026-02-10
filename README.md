@@ -141,7 +141,7 @@ backup_location = %USERPROFILE%\Documents\AndroidBackup
 
 ## Known Issues
 
-- Progress bar sometimes works sometimes not
+- Progress bar and speed calculation sometimes works sometimes not
 - File modification times may not be preserved exactly
 - Some system files may be skipped due to Android permissions
 - Very large transfers (100GB+) may take several hours
