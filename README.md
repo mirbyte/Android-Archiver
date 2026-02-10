@@ -1,5 +1,5 @@
 # Android-Archiver
-Fast and reliable Android device backup tool for Windows. Transfer files from your Android device to your PC faster than Windows File Explorer. Android Platform Tools are official and provided unmodified - you can download them yourself from [Google's official site](https://developer.android.com/tools/releases/platform-tools) if you prefer.
+Fast and reliable Android device backup tool for Windows. Transfer files from your Android device to your PC faster than Windows File Explorer. Android Platform Tools are official and provided unmodified - you can download them yourself from [Google's official site](https://developer.android.com/tools/releases/platform-tools) if you prefer. Please check known issues near the end of README.
 
 [![License](https://img.shields.io/github/license/mirbyte/Android-Archiver?color=34A853&maxAge=604800)](https://raw.githubusercontent.com/mirbyte/Android-Archiver/master/LICENSE)
 ![Size](https://img.shields.io/github/repo-size/mirbyte/Android-Archiver?label=size&color=34A853&maxAge=86400)
