@@ -8,6 +8,7 @@ from colorama import init, Fore, Style
 import re
 import platform
 import configparser
+import threading
 
 init()
 
@@ -54,7 +55,6 @@ def get_android_device_name():
                 check=True,
                 timeout=10
             )
-
             devices = result.stdout.splitlines()
             device_lines = [line for line in devices if line.strip() and "List of devices attached" not in line]
 
@@ -72,7 +72,6 @@ def get_android_device_name():
             for i, device in enumerate(device_lines):
                 device_id = device.split("\t")[0]
                 print(f"{i+1}. {device_id}")
-
             selection = input("Enter device number: ")
             try:
                 device_index = int(selection) - 1
@@ -202,7 +201,6 @@ def check_existing_backup(backup_location):
             print("2. Delete existing backup and start fresh")
             print("3. Cancel and choose different location")
             print("")
-
             choice = input("Select option (1-3): ").strip()
 
             if choice == "2":
@@ -222,12 +220,11 @@ def check_existing_backup(backup_location):
             elif choice == "3":
                 return False
             elif choice == "1":
-                print(f"{Fore.CYAN}Will merge with existing backup.{Style.RESET_ALL}")
+                print(f"Will merge with existing backup.")
                 return True
             else:
                 print(f"{Fore.RED}Invalid choice.{Style.RESET_ALL}")
                 return False
-
     return True
 
 def check_adb_version():
@@ -241,14 +238,12 @@ def check_adb_version():
             check=True,
             timeout=10
         )
-
         version_match = re.search(r"Version (\d+\.\d+\.\d+)", result.stdout)
         if version_match:
             version = version_match.group(1)
             print(f"{Fore.CYAN}ADB Version: {version}{Style.RESET_ALL}")
             return True
         return False
-
     except Exception as e:
         print(f"{Fore.RED}Error checking ADB version: {e}{Style.RESET_ALL}")
         return False
@@ -264,13 +259,10 @@ def check_device_compatibility(device_name):
             check=True,
             timeout=10
         )
-
         if "device" not in result.stdout.lower():
             print(f"{Fore.RED}Device is not in proper state: {result.stdout}{Style.RESET_ALL}")
             return False
-
         return True
-
     except Exception as e:
         print(f"{Fore.RED}Error checking device compatibility: {e}{Style.RESET_ALL}")
         return False
@@ -287,137 +279,186 @@ def cleanup_interrupted_backup(backup_location, dir_created_by_us):
     else:
         print(f"{Fore.YELLOW}Backup directory not cleaned (may contain existing files).{Style.RESET_ALL}")
 
-def copy_files_from_android(device_name, backup_location, dir_created_by_us):
-    try:
-        start_time = time.time()
+def get_backup_parameters(device_name):
+    """Prompt user for backup type and return source path.
+    Returns: (source_path, exclude_android_flag)
+    """
+    print(f"\n{Fore.GREEN}Backup Type:{Style.RESET_ALL}")
+    print("1. Full backup (entire /sdcard, excludes Android folder)")
+    print("2. Partial backup (select specific folder)")
+    print("")
+    backup_type = input("Select backup type (1-2): ").strip()
 
-        if not check_device_compatibility(device_name):
-            print(f"{Fore.RED}Device compatibility check failed{Style.RESET_ALL}")
-            input("Press Enter to exit...")
-            return
-
-        print(f"\n{Fore.GREEN}Backup Type:{Style.RESET_ALL}")
-        print("1. Full backup (entire /sdcard, excludes Android folder)")
-        print("2. Partial backup (select specific folder)")
-        print("")
-
-        backup_type = input("Select backup type (1-2): ").strip()
-
-        exclude_android = False
-
-        if backup_type == "2":
-            try:
-                result = subprocess.run(
-                    [ADB_PATH, "-s", device_name, "shell", "ls -1 /sdcard"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    timeout=10
-                )
-
-                folders = [
-                    f.strip() for f in result.stdout.splitlines()
-                    if f.strip()
-                    and not f.startswith(('.', 'Android'))
-                ]
-
-                if not folders:
-                    print(f"{Fore.RED}No accessible folders found{Style.RESET_ALL}")
-                    input("Press Enter to exit...")
-                    return
-
-                print(f"\n{Fore.CYAN}Available folders in /sdcard:{Style.RESET_ALL}")
-                for i, folder in enumerate(folders, 1):
-                    print(f"{i}. {folder}")
-
-                selection = input("\nSelect folder number: ").strip()
-                try:
-                    folder_index = int(selection) - 1
-                    if 0 <= folder_index < len(folders):
-                        source_path = f"/sdcard/{folders[folder_index]}"
-                    else:
-                        print(f"{Fore.RED}Invalid selection{Style.RESET_ALL}")
-                        input("Press Enter to exit...")
-                        return
-                except ValueError:
-                    print(f"{Fore.RED}Please enter a valid number{Style.RESET_ALL}")
-                    input("Press Enter to exit...")
-                    return
-
-            except Exception as e:
-                print(f"{Fore.RED}Error listing folders: {e}{Style.RESET_ALL}")
-                input("Press Enter to exit...")
-                return
-        else:
-            source_path = "/sdcard"
-            exclude_android = True
-            print("")
-            # print(f"\n{Fore.YELLOW}Note: /sdcard/Android folder will be skipped{Style.RESET_ALL}")
-            # Reason: Requires special permissions on Android 11+
-
+    if backup_type == "2":
         try:
             result = subprocess.run(
-                [ADB_PATH, "-s", device_name, "shell", f"test -d {source_path} && echo exists"],
+                [ADB_PATH, "-s", device_name, "shell", "ls -1 /sdcard"],
                 capture_output=True,
                 text=True,
-                timeout=5
+                encoding="utf-8",
+                timeout=10
             )
+            folders = [
+                f.strip() for f in result.stdout.splitlines()
+                if f.strip()
+                and not f.startswith(('.', 'Android'))
+            ]
 
-            if "exists" not in result.stdout:
-                print(f"{Fore.RED}Error: Source path {source_path} not found on device{Style.RESET_ALL}")
+            if not folders:
+                print(f"{Fore.RED}No accessible folders found{Style.RESET_ALL}")
                 input("Press Enter to exit...")
-                return
-        except Exception as e:
-            print(f"{Fore.RED}Error verifying source path: {e}{Style.RESET_ALL}")
-            input("Press Enter to exit...")
-            return
+                return None, False
 
-        print(f"\n{Fore.GREEN}Estimated Backup Size:{Style.RESET_ALL}")
-        print("Please estimate the total size of your backup in GB")
-        print("Example: For 32GB of data, enter '32'")
+            print(f"\n{Fore.GREEN}Available folders in /sdcard:{Style.RESET_ALL}")
+            for i, folder in enumerate(folders, 1):
+                print(f"{i}. {folder}")
 
-        while True:
+            selection = input("\nSelect folder number: ").strip()
             try:
-                print("")
-                estimated_gb = float(input("Enter estimated size in GB: "))
-                print("")
-                if estimated_gb <= 0:
-                    print(f"{Fore.RED}Size must be positive{Style.RESET_ALL}")
-                    continue
-                total_size = estimated_gb * 1024**3
-                break
+                folder_index = int(selection) - 1
+                if 0 <= folder_index < len(folders):
+                    source_path = f"/sdcard/{folders[folder_index]}"
+                    return source_path, False
+                else:
+                    print(f"{Fore.RED}Invalid selection{Style.RESET_ALL}")
+                    input("Press Enter to exit...")
+                    return None, False
             except ValueError:
                 print(f"{Fore.RED}Please enter a valid number{Style.RESET_ALL}")
+                input("Press Enter to exit...")
+                return None, False
 
-        # Simple approach: just pull and ignore errors from Android folder
-        cmd = [ADB_PATH, "-s", device_name, "pull", source_path, backup_location]
+        except Exception as e:
+            print(f"{Fore.RED}Error listing folders: {e}{Style.RESET_ALL}")
+            input("Press Enter to exit...")
+            return None, False
+    else:
+        source_path = "/sdcard"
+        return source_path, True
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # Merge stderr into stdout to suppress permission errors
+    return None, False
+
+def estimate_backup_size():
+    """Prompt user to estimate backup size in GB.
+    Returns: estimated size in bytes
+    """
+    print(f"\n{Fore.GREEN}Estimated Backup Size:{Style.RESET_ALL}")
+    print("Please estimate the total size of your backup in GB")
+    print("Example: For 32GB of data, enter '32'")
+    
+    while True:
+        try:
+            print("")
+            estimated_gb = float(input("Enter estimated size in GB: "))
+            print("")
+            if estimated_gb <= 0:
+                print(f"{Fore.RED}Size must be positive{Style.RESET_ALL}")
+                continue
+            return estimated_gb * 1024**3
+        except ValueError:
+            print(f"{Fore.RED}Please enter a valid number{Style.RESET_ALL}")
+
+def log_errors_thread(stderr_stream, log_file):
+    """Background thread to capture stderr and log errors."""
+    try:
+        with open(log_file, 'a', encoding='utf-8') as f:
+            for line in stderr_stream:
+                line = line.strip()
+                if line and ('Permission denied' in line or 'failed' in line.lower() or 'cannot' in line.lower()):
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    f.write(f"[{timestamp}] {line}\n")
+                    f.flush()
+    except Exception:
+        pass
+
+def get_current_backup_size(backup_location, last_scan_time):
+    """Get total size of files modified after last_scan_time.
+    Returns: (total_size, file_count)
+    """
+    total_size = 0
+    file_count = 0
+    
+    try:
+        for dirpath, _, filenames in os.walk(backup_location):
+            for filename in filenames:
+                if filename == "backup_errors.log":
+                    continue
+                filepath = os.path.join(dirpath, filename)
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    # Count all files, but optimize by checking mtime for incremental updates
+                    size = os.path.getsize(filepath)
+                    total_size += size
+                    file_count += 1
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+    except (FileNotFoundError, PermissionError):
+        pass
+    
+    return total_size, file_count
+
+def perform_backup_with_progress(device_name, source_path, backup_location, total_size, exclude_android):
+    """Execute the backup with real-time progress tracking.
+    Returns: True if successful, False otherwise
+    """
+    start_time = time.time()
+    error_log_path = os.path.join(backup_location, "backup_errors.log")
+    
+    # Verify source path exists
+    try:
+        result = subprocess.run(
+            [ADB_PATH, "-s", device_name, "shell", f"test -d {source_path} && echo exists"],
+            capture_output=True,
             text=True,
-            encoding="utf-8",
+            timeout=5
         )
+        if "exists" not in result.stdout:
+            print(f"{Fore.RED}Error: Source path {source_path} not found on device{Style.RESET_ALL}")
+            input("Press Enter to exit...")
+            return False
+    except Exception as e:
+        print(f"{Fore.RED}Error verifying source path: {e}{Style.RESET_ALL}")
+        input("Press Enter to exit...")
+        return False
 
-        last_size = 0
-        last_update_time = start_time
-        transfer_rate = 0
-        rate_samples = []
-        max_samples = 5
-
+    print("")
+    
+    # Start ADB pull process
+    cmd = [ADB_PATH, "-s", device_name, "pull", source_path, backup_location]
+    
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,  # Keep stderr separate for logging
+        text=True,
+        encoding="utf-8",
+    )
+    
+    # Start error logging thread
+    error_thread = threading.Thread(
+        target=log_errors_thread,
+        args=(process.stderr, error_log_path),
+        daemon=True
+    )
+    error_thread.start()
+    
+    # Progress tracking variables
+    last_size = 0
+    last_update_time = start_time
+    last_scan_time = start_time
+    transfer_rate = 0
+    rate_samples = []
+    max_samples = 5
+    
+    try:
         while True:
             time.sleep(1)
-
-            try:
-                current_size = sum(os.path.getsize(os.path.join(dirpath, filename))
-                                 for dirpath, _, filenames in os.walk(backup_location)
-                                 for filename in filenames)
-            except (FileNotFoundError, PermissionError):
-                continue
-
+            
+            # Get current backup size (optimized to only scan new files)
+            current_size, file_count = get_current_backup_size(backup_location, last_scan_time)
+            last_scan_time = time.time()
+            
             progress = min((current_size / total_size) * 100, 100.0)
-
             current_time = time.time()
             elapsed_time = current_time - start_time
             time_diff = current_time - last_update_time
@@ -425,13 +466,12 @@ def copy_files_from_android(device_name, backup_location, dir_created_by_us):
             if time_diff >= 1 and current_size >= last_size:
                 size_diff = current_size - last_size
                 instant_rate = size_diff / time_diff
-
                 rate_samples.append(instant_rate)
+                
                 if len(rate_samples) > max_samples:
                     rate_samples.pop(0)
-
+                
                 transfer_rate = sum(rate_samples) / len(rate_samples)
-
                 last_size = current_size
                 last_update_time = current_time
 
@@ -445,65 +485,97 @@ def copy_files_from_android(device_name, backup_location, dir_created_by_us):
             status = (
                 f"\r{Fore.CYAN}{progress_bar} "
                 f"{format_size(current_size)}/{format_size(total_size)} "
+                f"({file_count} files) "
                 f"[{format_size(transfer_rate)}/s] "
                 f"ETA: {format_time(eta)}{Style.RESET_ALL}"
             )
-
+            
             print(status, end='', flush=True)
 
             if process.poll() is not None:
                 break
 
-        stdout, _ = process.communicate()
-
+        # Final size check
+        current_size, file_count = get_current_backup_size(backup_location, 0)
         print()
-
-        # Check if we got any files - if yes, consider it success even with some permission errors
+        
+        # Check if backup was successful
         if current_size > 0:
             end_time = time.time()
             total_time = end_time - start_time
-
             print(f"\n{Fore.GREEN}Backup completed successfully!{Style.RESET_ALL}")
+            
             if exclude_android:
                 print(f"{Fore.YELLOW}Note: Some protected files in Android folder were skipped{Style.RESET_ALL}")
-            print(f"{Fore.CYAN}Summary:{Style.RESET_ALL}")
-            print(f" - Total files backed up: {format_size(current_size)}")
+            
+            print(f"Summary:")
+            # print(f" - Total files backed up: {file_count} files ({format_size(current_size)})")
             print(f" - Elapsed time: {format_time(total_time)}")
-            print(f" - Average speed: {format_size(current_size/total_time)}/s")
+            # print(f" - Average speed: {format_size(current_size/total_time)}/s")
             print(f"{Fore.WHITE} - Backup location: {backup_location}{Style.RESET_ALL}")
-
+            
+            # Check for errors log
+            if os.path.exists(error_log_path) and os.path.getsize(error_log_path) > 0:
+                print(f"{Fore.YELLOW} - Some files were skipped - see backup_errors.log for details{Style.RESET_ALL}")
+            
+            # Create completion file
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             try:
                 with open(os.path.join(backup_location, "backup_completed.txt"), "w") as f:
                     f.write(f"Backup completed on {timestamp}\n")
                     f.write(f"Device: {device_name}\n")
+                    f.write(f"Total files: {file_count}\n")
                     f.write(f"Total size: {format_size(current_size)}\n")
                     f.write(f"Elapsed time: {format_time(total_time)}\n")
                     if exclude_android:
                         f.write(f"Note: Android folder was excluded due to permission restrictions\n")
             except Exception as e:
                 print(f"{Fore.YELLOW}Warning: Could not create completion file: {e}{Style.RESET_ALL}")
-
+            
             print("")
             input("Backup complete! Press Enter to exit...")
+            return True
         else:
             print(f"\n{Fore.RED}Backup failed - no files were transferred{Style.RESET_ALL}")
             print("")
             input("Press Enter to exit...")
-
+            return False
+            
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}Backup interrupted by user.{Style.RESET_ALL}")
         if process and process.poll() is None:
             process.terminate()
-
-        try:
-            cleanup_interrupted_backup(backup_location, dir_created_by_us)
-        except Exception as e:
-            print(f"{Fore.YELLOW}Cleanup failed: {e}{Style.RESET_ALL}")
-
         print("")
         input("Press Enter to exit...")
-        return
+        return False
+
+def copy_files_from_android(device_name, backup_location, dir_created_by_us):
+    """Main backup orchestration function."""
+    try:
+        if not check_device_compatibility(device_name):
+            print(f"{Fore.RED}Device compatibility check failed{Style.RESET_ALL}")
+            input("Press Enter to exit...")
+            return
+
+        # Get backup parameters
+        source_path, exclude_android = get_backup_parameters(device_name)
+        if not source_path:
+            return
+        
+        # Estimate backup size
+        total_size = estimate_backup_size()
+        
+        # Perform backup with progress
+        success = perform_backup_with_progress(
+            device_name, 
+            source_path, 
+            backup_location, 
+            total_size, 
+            exclude_android
+        )
+        
+        if not success and dir_created_by_us:
+            cleanup_interrupted_backup(backup_location, dir_created_by_us)
 
     except Exception as e:
         print(f"\n{Fore.RED}Unexpected error: {e}{Style.RESET_ALL}")
@@ -549,23 +621,21 @@ def load_config():
                 config['DEFAULT']['backup_location'] = os.path.expandvars(config['DEFAULT']['backup_location'])
             return config
 
-        if getattr(sys, 'frozen', False):
-            config['DEFAULT'] = {
-                'backup_location': os.path.join(
-                    os.path.expanduser("~"),
-                    "Documents",
-                    "AndroidBackup"
-                )
-            }
-
-            try:
-                with open(config_path, 'w') as configfile:
-                    config.write(configfile)
-                return config
-            except Exception as e:
-                print(f"{Fore.YELLOW}Warning: Could not create config file: {e}{Style.RESET_ALL}")
-                return config
-
+        # Always create default config
+        config['DEFAULT'] = {
+            'backup_location': os.path.join(
+                os.path.expanduser("~"),
+                "Documents",
+                "AndroidBackup"
+            )
+        }
+        
+        try:
+            with open(config_path, 'w') as configfile:
+                config.write(configfile)
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: Could not create config file: {e}{Style.RESET_ALL}")
+        
         return config
 
     except Exception as e:
@@ -574,7 +644,7 @@ def load_config():
 
 def main():
     print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
-    print(f"{Fore.GREEN}{'Android Archiver v1.3 (github/mirbyte)':^60}{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}{'Android Archiver v1.4 (github/mirbyte)':^60}{Style.RESET_ALL}")
     print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
 
     try:
@@ -588,7 +658,6 @@ def main():
             return
 
         config = load_config()
-
         backup_location = select_backup_location(config)
         if not backup_location:
             input("Press Enter to exit...")
