@@ -487,20 +487,16 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
                 last_size = current_size
                 last_update_time = current_time
 
-            if transfer_rate > 0:
-                remaining_bytes = total_size - current_size
-                eta = remaining_bytes / transfer_rate
-            else:
-                eta = 0
 
             progress_bar = draw_progress_bar(progress, width=30)
             status = (
                 f"\r{Fore.CYAN}{progress_bar} "
                 f"{format_size(current_size)}/{format_size(total_size)} "
                 f"({file_count} files) "
-                f"[{format_size(transfer_rate)}/s] "
-                f"ETA: {format_time(eta)}{Style.RESET_ALL}"
+                f"[{format_size(transfer_rate)}/s]{Style.RESET_ALL}"
             )
+
+
             
             print(status, end='', flush=True)
 
