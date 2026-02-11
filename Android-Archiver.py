@@ -1,9 +1,14 @@
+"""
+Android Archiver - A tool for backing up Android device storage via ADB.
+Supports full and partial backups with real-time progress tracking and error logging.
+"""
+
 import os
 import subprocess
 import time
 import sys
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime
 from colorama import init, Fore, Style
 import re
 import platform
@@ -72,6 +77,7 @@ def get_android_device_name():
             for i, device in enumerate(device_lines):
                 device_id = device.split("\t")[0]
                 print(f"{i+1}. {device_id}")
+            print("")
             selection = input("Enter device number: ")
             try:
                 device_index = int(selection) - 1
@@ -119,6 +125,8 @@ def get_android_device_name():
 
 def select_backup_location(config):
     """Select the backup location using simple console prompts."""
+    print("-" * 60)
+    
     user_home = os.path.expanduser("~")
 
     if config.has_option('DEFAULT', 'backup_location'):
@@ -281,8 +289,11 @@ def cleanup_interrupted_backup(backup_location, dir_created_by_us):
 
 def get_backup_parameters(device_name):
     """Prompt user for backup type and return source path.
+    
     Returns: (source_path, exclude_android_flag)
     """
+    print("-" * 60)
+    
     print(f"\n{Fore.GREEN}Backup Type:{Style.RESET_ALL}")
     print("1. Full backup (entire /sdcard, excludes Android folder)")
     print("2. Partial backup (select specific folder)")
@@ -313,7 +324,8 @@ def get_backup_parameters(device_name):
             for i, folder in enumerate(folders, 1):
                 print(f"{i}. {folder}")
 
-            selection = input("\nSelect folder number: ").strip()
+            print("")
+            selection = input("Select folder number: ").strip()
             try:
                 folder_index = int(selection) - 1
                 if 0 <= folder_index < len(folders):
@@ -340,8 +352,11 @@ def get_backup_parameters(device_name):
 
 def estimate_backup_size():
     """Prompt user to estimate backup size in GB.
+    
     Returns: estimated size in bytes
     """
+    print("-" * 60)
+    
     print(f"\n{Fore.GREEN}Estimated Backup Size:{Style.RESET_ALL}")
     print("Please estimate the total size of your backup in GB")
     print("Example: For 32GB of data, enter '32'")
@@ -373,6 +388,7 @@ def log_errors_thread(stderr_stream, log_file):
 
 def get_current_backup_size(backup_location, last_scan_time):
     """Get total size of files modified after last_scan_time.
+    
     Returns: (total_size, file_count)
     """
     total_size = 0
@@ -385,8 +401,6 @@ def get_current_backup_size(backup_location, last_scan_time):
                     continue
                 filepath = os.path.join(dirpath, filename)
                 try:
-                    mtime = os.path.getmtime(filepath)
-                    # Count all files, but optimize by checking mtime for incremental updates
                     size = os.path.getsize(filepath)
                     total_size += size
                     file_count += 1
@@ -399,12 +413,12 @@ def get_current_backup_size(backup_location, last_scan_time):
 
 def perform_backup_with_progress(device_name, source_path, backup_location, total_size, exclude_android):
     """Execute the backup with real-time progress tracking.
+    
     Returns: True if successful, False otherwise
     """
     start_time = time.time()
     error_log_path = os.path.join(backup_location, "backup_errors.log")
     
-    # Verify source path exists
     try:
         result = subprocess.run(
             [ADB_PATH, "-s", device_name, "shell", f"test -d {source_path} && echo exists"],
@@ -421,20 +435,19 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
         input("Press Enter to exit...")
         return False
 
+    print("-" * 60)
     print("")
     
-    # Start ADB pull process
     cmd = [ADB_PATH, "-s", device_name, "pull", source_path, backup_location]
     
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,  # Keep stderr separate for logging
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
     )
     
-    # Start error logging thread
     error_thread = threading.Thread(
         target=log_errors_thread,
         args=(process.stderr, error_log_path),
@@ -442,7 +455,6 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
     )
     error_thread.start()
     
-    # Progress tracking variables
     last_size = 0
     last_update_time = start_time
     last_scan_time = start_time
@@ -454,7 +466,6 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
         while True:
             time.sleep(1)
             
-            # Get current backup size (optimized to only scan new files)
             current_size, file_count = get_current_backup_size(backup_location, last_scan_time)
             last_scan_time = time.time()
             
@@ -495,11 +506,9 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
             if process.poll() is not None:
                 break
 
-        # Final size check
         current_size, file_count = get_current_backup_size(backup_location, 0)
         print()
         
-        # Check if backup was successful
         if current_size > 0:
             end_time = time.time()
             total_time = end_time - start_time
@@ -514,11 +523,9 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
             # print(f" - Average speed: {format_size(current_size/total_time)}/s")
             print(f"{Fore.WHITE} - Backup location: {backup_location}{Style.RESET_ALL}")
             
-            # Check for errors log
             if os.path.exists(error_log_path) and os.path.getsize(error_log_path) > 0:
                 print(f"{Fore.YELLOW} - Some files were skipped - see backup_errors.log for details{Style.RESET_ALL}")
             
-            # Create completion file
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             try:
                 with open(os.path.join(backup_location, "backup_completed.txt"), "w") as f:
@@ -557,20 +564,17 @@ def copy_files_from_android(device_name, backup_location, dir_created_by_us):
             input("Press Enter to exit...")
             return
 
-        # Get backup parameters
         source_path, exclude_android = get_backup_parameters(device_name)
         if not source_path:
             return
         
-        # Estimate backup size
         total_size = estimate_backup_size()
         
-        # Perform backup with progress
         success = perform_backup_with_progress(
-            device_name, 
-            source_path, 
-            backup_location, 
-            total_size, 
+            device_name,
+            source_path,
+            backup_location,
+            total_size,
             exclude_android
         )
         
@@ -621,7 +625,6 @@ def load_config():
                 config['DEFAULT']['backup_location'] = os.path.expandvars(config['DEFAULT']['backup_location'])
             return config
 
-        # Always create default config
         config['DEFAULT'] = {
             'backup_location': os.path.join(
                 os.path.expanduser("~"),
