@@ -386,8 +386,8 @@ def log_errors_thread(stderr_stream, log_file):
     except Exception:
         pass
 
-def get_current_backup_size(backup_location, last_scan_time):
-    """Get total size of files modified after last_scan_time.
+def get_current_backup_size(backup_location, backup_start_time):
+    """Get total size of files created/modified during this backup.
     
     Returns: (total_size, file_count)
     """
@@ -401,9 +401,12 @@ def get_current_backup_size(backup_location, last_scan_time):
                     continue
                 filepath = os.path.join(dirpath, filename)
                 try:
-                    size = os.path.getsize(filepath)
-                    total_size += size
-                    file_count += 1
+                    mtime = os.path.getmtime(filepath)
+                    # Only count files modified after backup started
+                    if mtime >= backup_start_time:
+                        size = os.path.getsize(filepath)
+                        total_size += size
+                        file_count += 1
                 except (FileNotFoundError, PermissionError, OSError):
                     continue
     except (FileNotFoundError, PermissionError):
@@ -457,7 +460,6 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
     
     last_size = 0
     last_update_time = start_time
-    last_scan_time = start_time
     transfer_rate = 0
     rate_samples = []
     max_samples = 5
@@ -466,8 +468,7 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
         while True:
             time.sleep(1)
             
-            current_size, file_count = get_current_backup_size(backup_location, last_scan_time)
-            last_scan_time = time.time()
+            current_size, file_count = get_current_backup_size(backup_location, start_time)
             
             progress = min((current_size / total_size) * 100, 100.0)
             current_time = time.time()
@@ -506,7 +507,7 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
             if process.poll() is not None:
                 break
 
-        current_size, file_count = get_current_backup_size(backup_location, 0)
+        current_size, file_count = get_current_backup_size(backup_location, start_time)
         print()
         
         if current_size > 0:
