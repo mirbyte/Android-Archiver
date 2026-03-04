@@ -28,7 +28,7 @@ Fast and reliable Android device backup tool for Windows. Transfer files from yo
 - USB cable for device connection
 
 ## Installation
-1. Download the project zip
+1. [Download](https://github.com/mirbyte/Android-Archiver/archive/refs/heads/main.zip) the project zip
 2. Unzip and run the .exe
 3. The folder structure should be:
    ```
