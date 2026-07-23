@@ -8,6 +8,7 @@ import subprocess
 import time
 import sys
 import shutil
+import shlex
 from datetime import datetime
 from colorama import init, Fore, Style
 import re
@@ -98,7 +99,7 @@ def get_android_device_name():
         def get_device_prop(prop):
             try:
                 result = subprocess.run(
-                    [ADB_PATH, "-s", device_name, "shell", f"getprop {prop}"],
+                    [ADB_PATH, "-s", device_name, "shell", f"getprop {shell_quote(prop)}"],
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
@@ -302,17 +303,11 @@ def get_backup_parameters(device_name):
 
     if backup_type == "2":
         try:
-            result = subprocess.run(
-                [ADB_PATH, "-s", device_name, "shell", "ls -1 /sdcard"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=10
-            )
             folders = [
-                f.strip() for f in result.stdout.splitlines()
-                if f.strip()
-                and not f.startswith(('.', 'Android'))
+                f for f in list_remote_entries(device_name, "/sdcard")
+                if f
+                and not f.startswith('.')
+                and f != 'Android'
             ]
 
             if not folders:
@@ -373,18 +368,56 @@ def estimate_backup_size():
         except ValueError:
             print(f"{Fore.RED}Please enter a valid number{Style.RESET_ALL}")
 
+# adb pull progress lines like "[ 50%] /sdcard/foo.mp4"
+_PROGRESS_LINE_RE = re.compile(r'^\[\s*\d+%\]')
+_WIN_INVALID_CHARS = re.compile(r'[<>:"/\\|?*]')
+_PULL_RETRIES = 3
+_MAX_INDIVIDUAL_PULLS = 25
+_MAX_GAP_DEPTH = 3
+_CONSOLE_LOCK = threading.Lock()
+
+def shell_quote(value):
+    """Quote a value for safe use inside an adb shell command string."""
+    return shlex.quote(str(value))
+
+def adb_shell(device_name, command, timeout=60):
+    """Run a single shell command string on the device."""
+    return subprocess.run(
+        [ADB_PATH, "-s", device_name, "shell", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout
+    )
+
 def log_errors_thread(stderr_stream, log_file):
-    """Background thread to capture stderr and log errors."""
+    """Background thread to capture stderr; log all non-progress lines."""
     try:
         with open(log_file, 'a', encoding='utf-8') as f:
             for line in stderr_stream:
                 line = line.strip()
-                if line and ('Permission denied' in line or 'failed' in line.lower() or 'cannot' in line.lower()):
-                    timestamp = datetime.now().strftime("%H:%M:%S")
-                    f.write(f"[{timestamp}] {line}\n")
-                    f.flush()
+                if not line or _PROGRESS_LINE_RE.match(line):
+                    continue
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                f.write(f"[{timestamp}] {line}\n")
+                f.flush()
     except Exception:
         pass
+
+def append_error_log(error_log_path, message):
+    try:
+        with open(error_log_path, 'a', encoding='utf-8') as f:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
+
+def sanitize_component(name):
+    """Make a path component safe for Windows filenames."""
+    name = _WIN_INVALID_CHARS.sub('_', name)
+    name = name.rstrip(' .')
+    return name or '_'
 
 def get_current_backup_size(backup_location, backup_start_time):
     """Get total size of files created/modified during this backup.
@@ -393,16 +426,16 @@ def get_current_backup_size(backup_location, backup_start_time):
     """
     total_size = 0
     file_count = 0
+    skip_names = {"backup_errors.log", "backup_completed.txt", "backup_incomplete.txt"}
     
     try:
         for dirpath, _, filenames in os.walk(backup_location):
             for filename in filenames:
-                if filename == "backup_errors.log":
+                if filename in skip_names:
                     continue
                 filepath = os.path.join(dirpath, filename)
                 try:
                     mtime = os.path.getmtime(filepath)
-                    # Only count files modified after backup started
                     if mtime >= backup_start_time:
                         size = os.path.getsize(filepath)
                         total_size += size
@@ -414,144 +447,731 @@ def get_current_backup_size(backup_location, backup_start_time):
     
     return total_size, file_count
 
-def perform_backup_with_progress(device_name, source_path, backup_location, total_size, exclude_android):
-    """Execute the backup with real-time progress tracking.
-    
-    Returns: True if successful, False otherwise
-    """
-    start_time = time.time()
-    error_log_path = os.path.join(backup_location, "backup_errors.log")
-    
+def count_remote_files(device_name, source_path, exclude_android=False):
+    """Count regular files under source_path on the device. Returns int or None."""
+    quoted = shell_quote(source_path)
+    if exclude_android:
+        find_expr = f"find {quoted} -type f ! -path '*/Android/*' 2>/dev/null | wc -l"
+    else:
+        find_expr = f"find {quoted} -type f 2>/dev/null | wc -l"
     try:
-        result = subprocess.run(
-            [ADB_PATH, "-s", device_name, "shell", f"test -d {source_path} && echo exists"],
-            capture_output=True,
-            text=True,
-            timeout=5
+        result = adb_shell(device_name, find_expr, timeout=300)
+        output = (result.stdout or "").strip().replace("\r", "")
+        if not output:
+            return None
+        return int(output.splitlines()[-1].strip())
+    except Exception:
+        return None
+
+def count_local_files(pulled_root, exclude_android=False):
+    """Count files under the pulled directory tree on disk."""
+    if not os.path.isdir(pulled_root):
+        return 0
+    skip_names = {"backup_errors.log", "backup_completed.txt", "backup_incomplete.txt"}
+    count = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(pulled_root):
+            if exclude_android:
+                dirnames[:] = [d for d in dirnames if d != "Android"]
+            for filename in filenames:
+                if filename in skip_names:
+                    continue
+                count += 1
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+    return count
+
+def list_remote_entries(device_name, remote_dir):
+    """List immediate child names under remote_dir."""
+    try:
+        result = adb_shell(
+            device_name,
+            f"ls -1 {shell_quote(remote_dir)}",
+            timeout=60
         )
-        if "exists" not in result.stdout:
-            print(f"{Fore.RED}Error: Source path {source_path} not found on device{Style.RESET_ALL}")
-            input("Press Enter to exit...")
+        return [
+            line.strip().replace("\r", "")
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
+    except Exception:
+        return []
+
+def list_remote_files(device_name, remote_dir):
+    """List all file paths under remote_dir on the device."""
+    try:
+        result = adb_shell(
+            device_name,
+            f"find {shell_quote(remote_dir)} -type f 2>/dev/null",
+            timeout=300
+        )
+        return [
+            line.strip().replace("\r", "")
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
+    except Exception:
+        return []
+
+def get_remote_size(device_name, remote_path):
+    try:
+        result = adb_shell(
+            device_name,
+            f"stat -c %s {shell_quote(remote_path)}",
+            timeout=15
+        )
+        output = (result.stdout or "").strip().replace("\r", "")
+        if not output:
+            return None
+        return int(output.splitlines()[-1].strip())
+    except Exception:
+        return None
+
+def remote_to_local_file(remote_file, remote_root, local_root):
+    """Map a remote file path to a Windows-safe local path under local_root."""
+    remote_root = remote_root.rstrip("/")
+    if remote_file.startswith(remote_root + "/"):
+        rel = remote_file[len(remote_root) + 1:]
+    else:
+        rel = remote_file.lstrip("/")
+    parts = [sanitize_component(p) for p in rel.split("/") if p]
+    return os.path.join(local_root, *parts) if parts else local_root
+
+def ensure_extended_path(path):
+    """On Windows, prefix absolute paths with \\\\?\\ to allow long paths."""
+    if platform.system() != "Windows":
+        return path
+    abs_path = os.path.abspath(path)
+    if abs_path.startswith("\\\\?\\"):
+        return abs_path
+    if abs_path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + abs_path[2:]
+    return "\\\\?\\" + abs_path
+
+def remote_path_needs_stream(remote_path):
+    """True if any remote path component is illegal/problematic for Windows adb pull."""
+    for part in remote_path.replace("\\", "/").split("/"):
+        if not part:
+            continue
+        if _WIN_INVALID_CHARS.search(part):
+            return True
+        if part != part.rstrip(" ."):
+            return True
+    return False
+
+def build_pull_jobs(device_name, source_path, backup_location, exclude_android):
+    """Build (remote_path, local_parent) jobs. Full backup pulls top-level items separately."""
+    source_path = source_path.rstrip("/") or "/sdcard"
+    if source_path == "/sdcard" and exclude_android:
+        pulled_root = os.path.join(backup_location, "sdcard")
+        os.makedirs(pulled_root, exist_ok=True)
+        jobs = []
+        for name in list_remote_entries(device_name, "/sdcard"):
+            if name == "Android":
+                continue
+            jobs.append((f"/sdcard/{name}", pulled_root, name))
+        return jobs, pulled_root
+    basename = os.path.basename(source_path)
+    pulled_root = os.path.join(backup_location, basename)
+    return [(source_path, backup_location, basename)], pulled_root
+
+def adb_stream_file(device_name, remote_path, local_dest_path, error_log_path=None, active_process=None):
+    """Copy one remote file via exec-out cat (bypasses Windows adb pull path parsing)."""
+    dest = ensure_extended_path(local_dest_path)
+    parent = os.path.dirname(dest)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            if error_log_path:
+                append_error_log(error_log_path, f"makedirs failed for {local_dest_path}: {e}")
             return False
+
+    cmd = [ADB_PATH, "-s", device_name, "exec-out", f"cat {shell_quote(remote_path)}"]
+    try:
+        with open(dest, "wb") as out:
+            process = subprocess.Popen(
+                cmd,
+                stdout=out,
+                stderr=subprocess.PIPE,
+            )
+            if active_process is not None:
+                active_process["proc"] = process
+            _, err = process.communicate()
+            rc = process.returncode if process.returncode is not None else -1
+            if active_process is not None:
+                active_process["proc"] = None
+
+        if rc != 0:
+            if error_log_path:
+                err_text = (err or b"").decode("utf-8", errors="replace").strip()
+                append_error_log(
+                    error_log_path,
+                    f"exec-out cat failed ({rc}) for {remote_path}"
+                    + (f": {err_text}" if err_text else "")
+                )
+            try:
+                if os.path.isfile(dest) and os.path.getsize(dest) == 0:
+                    os.remove(dest)
+            except OSError:
+                pass
+            return False
+
+        remote_size = get_remote_size(device_name, remote_path)
+        try:
+            local_size = os.path.getsize(dest)
+        except OSError:
+            return False
+        if remote_size is not None and local_size != remote_size:
+            if error_log_path:
+                append_error_log(
+                    error_log_path,
+                    f"Size mismatch after stream {remote_path}: "
+                    f"remote={remote_size} local={local_size}"
+                )
+            return False
+        return True
     except Exception as e:
-        print(f"{Fore.RED}Error verifying source path: {e}{Style.RESET_ALL}")
-        input("Press Enter to exit...")
+        if error_log_path:
+            append_error_log(error_log_path, f"exec-out cat error for {remote_path}: {e}")
+        if active_process is not None:
+            active_process["proc"] = None
         return False
 
-    print("-" * 60)
-    print("")
-    
-    cmd = [ADB_PATH, "-s", device_name, "pull", source_path, backup_location]
-    
+def adb_pull(device_name, remote_path, local_dest, error_log_path, active_process=None, dest_is_file=False):
+    """Pull remote_path to local_dest (directory parent, or file path if dest_is_file)."""
+    try:
+        if dest_is_file:
+            parent = os.path.dirname(local_dest)
+            if parent:
+                os.makedirs(ensure_extended_path(parent), exist_ok=True)
+        else:
+            os.makedirs(ensure_extended_path(local_dest), exist_ok=True)
+    except OSError as e:
+        append_error_log(error_log_path, f"makedirs failed for {local_dest}: {e}")
+        return -1
+
+    cmd = [ADB_PATH, "-s", device_name, "pull", remote_path, local_dest]
     process = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        errors="replace",
     )
-    
+    if active_process is not None:
+        active_process["proc"] = process
+
     error_thread = threading.Thread(
         target=log_errors_thread,
         args=(process.stderr, error_log_path),
         daemon=True
     )
     error_thread.start()
-    
-    last_size = 0
-    last_update_time = start_time
-    transfer_rate = 0
-    rate_samples = []
-    max_samples = 5
-    
-    try:
-        while True:
-            time.sleep(1)
-            
-            current_size, file_count = get_current_backup_size(backup_location, start_time)
-            
-            progress = min((current_size / total_size) * 100, 100.0)
-            current_time = time.time()
-            elapsed_time = current_time - start_time
-            time_diff = current_time - last_update_time
+    process.wait()
+    error_thread.join(timeout=10)
+    if active_process is not None:
+        active_process["proc"] = None
+    return process.returncode if process.returncode is not None else -1
 
+def tree_complete(device_name, remote_path, local_path):
+    remote_count = count_remote_files(device_name, remote_path, False)
+    if remote_count is None:
+        return True, None, None
+    if remote_count == 0:
+        return os.path.exists(local_path), 0, 0
+    local_count = count_local_files(local_path, False)
+    return local_count >= remote_count, remote_count, local_count
+
+def clear_progress_line():
+    print("\r" + " " * 160 + "\r", end="", flush=True)
+
+def print_notice(msg):
+    """Print a status message without colliding with the progress line."""
+    with _CONSOLE_LOCK:
+        clear_progress_line()
+        print(msg, flush=True)
+
+def collect_missing_files(device_name, remote_dir, local_dir):
+    """Return list of (remote_file, local_file) that are missing or empty locally."""
+    remote_files = list_remote_files(device_name, remote_dir)
+    missing = []
+    for remote_file in remote_files:
+        local_file = remote_to_local_file(remote_file, remote_dir, local_dir)
+        if local_file_ok(local_file):
+            try:
+                path = local_file if os.path.isfile(local_file) else ensure_extended_path(local_file)
+                if os.path.getsize(path) > 0:
+                    continue
+            except OSError:
+                pass
+            remote_size = get_remote_size(device_name, remote_file)
+            if remote_size == 0:
+                continue
+        missing.append((remote_file, local_file))
+    return missing
+
+def group_missing_by_child(remote_dir, missing_pairs):
+    """Group missing files by immediate child name under remote_dir.
+    
+    Returns: dict[child_name_or_None, list[(remote, local)]]
+    None key = files directly under remote_dir.
+    """
+    remote_dir = remote_dir.rstrip("/")
+    groups = {}
+    prefix = remote_dir + "/"
+    for remote_file, local_file in missing_pairs:
+        if remote_file.startswith(prefix):
+            rel = remote_file[len(prefix):]
+        else:
+            rel = remote_file.lstrip("/")
+        parts = [p for p in rel.split("/") if p]
+        if len(parts) <= 1:
+            key = None
+        else:
+            key = parts[0]
+        groups.setdefault(key, []).append((remote_file, local_file))
+    return groups
+
+def local_file_ok(local_file, remote_size=None):
+    """True if local_file exists and matches remote_size when known."""
+    try:
+        path = local_file
+        if not os.path.isfile(path):
+            ext = ensure_extended_path(local_file)
+            if ext != local_file and os.path.isfile(ext):
+                path = ext
+            else:
+                return False
+        size = os.path.getsize(path)
+        if remote_size is None:
+            return True
+        return size == remote_size
+    except OSError:
+        return False
+
+def pull_file_list(
+    device_name, missing_pairs, error_log_path,
+    active_process=None, status_holder=None, label="fill"
+):
+    """Pull a small list of files individually. Returns (copied, failed).
+    
+    Uses exec-out streaming when remote names break Windows adb pull.
+    """
+    copied = 0
+    failed = 0
+    total = len(missing_pairs)
+    for i, (remote_file, local_file) in enumerate(missing_pairs, 1):
+        if status_holder is not None:
+            status_holder["label"] = f"| {label} {i}/{total}"
+
+        ok = False
+        use_stream = remote_path_needs_stream(remote_file)
+
+        if not use_stream:
+            for _ in range(_PULL_RETRIES):
+                rc = adb_pull(
+                    device_name, remote_file, local_file, error_log_path,
+                    active_process, dest_is_file=True
+                )
+                if rc == 0 and local_file_ok(local_file):
+                    ok = True
+                    break
+                if local_file_ok(local_file):
+                    # File landed despite non-zero rc
+                    ok = True
+                    break
+                time.sleep(0.5)
+
+        if not ok:
+            if use_stream:
+                append_error_log(
+                    error_log_path,
+                    f"Streaming (illegal Windows name): {remote_file}"
+                )
+            else:
+                append_error_log(
+                    error_log_path,
+                    f"adb pull failed, trying exec-out stream: {remote_file}"
+                )
+            for _ in range(_PULL_RETRIES):
+                if adb_stream_file(
+                    device_name, remote_file, local_file,
+                    error_log_path, active_process
+                ):
+                    ok = True
+                    break
+                time.sleep(0.5)
+
+        if ok:
+            copied += 1
+        else:
+            failed += 1
+            append_error_log(error_log_path, f"Failed to copy file: {remote_file}")
+    return copied, failed
+
+def fill_missing_gaps(
+    device_name, remote_dir, local_dir, error_log_path,
+    active_process=None, status_holder=None, depth=0
+):
+    """Fill gaps by re-pulling incomplete subdirectories, not every file.
+    
+    Falls back to per-file pulls only for small leftover sets or root-level files.
+    Returns (copied_estimate, failed).
+    """
+    missing = collect_missing_files(device_name, remote_dir, local_dir)
+    if not missing:
+        return 0, 0
+
+    print_notice(
+        f"{Fore.YELLOW}Gap fill in {os.path.basename(remote_dir) or remote_dir}: "
+        f"{len(missing)} missing{Style.RESET_ALL}"
+    )
+
+    if len(missing) <= _MAX_INDIVIDUAL_PULLS or depth >= _MAX_GAP_DEPTH:
+        return pull_file_list(
+            device_name, missing, error_log_path,
+            active_process, status_holder, label="fill"
+        )
+
+    groups = group_missing_by_child(remote_dir, missing)
+    copied = 0
+    failed = 0
+    root_files = groups.pop(None, [])
+
+    child_items = list(groups.items())
+    for idx, (child_name, child_missing) in enumerate(child_items, 1):
+        remote_child = f"{remote_dir.rstrip('/')}/{child_name}"
+        local_child = os.path.join(local_dir, sanitize_component(child_name))
+        if status_holder is not None:
+            status_holder["label"] = (
+                f"| gap dir {idx}/{len(child_items)} {child_name}"
+            )
+        print_notice(
+            f"{Fore.YELLOW}Re-pulling subdirectory: {child_name} "
+            f"({len(child_missing)} missing){Style.RESET_ALL}"
+        )
+        append_error_log(error_log_path, f"Gap-fill subdirectory pull: {remote_child}")
+        adb_pull(
+            device_name, remote_child, local_dir, error_log_path, active_process
+        )
+
+        still = [
+            (r, l) for r, l in child_missing
+            if not local_file_ok(l)
+        ]
+        if not still:
+            copied += len(child_missing)
+            continue
+
+        if len(still) <= _MAX_INDIVIDUAL_PULLS:
+            c, f = pull_file_list(
+                device_name, still, error_log_path,
+                active_process, status_holder, label=f"{child_name}"
+            )
+            copied += c
+            failed += f
+        else:
+            c, f = fill_missing_gaps(
+                device_name, remote_child, local_child, error_log_path,
+                active_process, status_holder, depth=depth + 1
+            )
+            copied += c
+            failed += f
+
+    if root_files:
+        if len(root_files) <= _MAX_INDIVIDUAL_PULLS or depth >= _MAX_GAP_DEPTH:
+            c, f = pull_file_list(
+                device_name, root_files, error_log_path,
+                active_process, status_holder, label="root"
+            )
+            copied += c
+            failed += f
+        else:
+            # Too many loose root files: one more parent pull then small leftovers
+            parent = os.path.dirname(local_dir.rstrip("\\/")) or local_dir
+            adb_pull(device_name, remote_dir, parent, error_log_path, active_process)
+            still = [
+                (r, l) for r, l in root_files
+                if not local_file_ok(l)
+            ]
+            if still:
+                c, f = pull_file_list(
+                    device_name, still[:_MAX_INDIVIDUAL_PULLS], error_log_path,
+                    active_process, status_holder, label="root"
+                )
+                copied += c
+                failed += f + max(0, len(still) - _MAX_INDIVIDUAL_PULLS)
+                for r, _ in still[_MAX_INDIVIDUAL_PULLS:]:
+                    append_error_log(
+                        error_log_path,
+                        f"Skipped after gap-fill limit: {r}"
+                    )
+
+    return copied, failed
+
+def repair_tree(
+    device_name, remote_path, local_path, label, error_log_path,
+    active_process=None, status_holder=None
+):
+    """Gap-fill an incomplete tree. Avoids full re-pull when data is already present."""
+    complete, remote_count, local_count = tree_complete(device_name, remote_path, local_path)
+    if complete:
+        return True
+
+    missing = 0
+    if remote_count is not None and local_count is not None:
+        missing = max(remote_count - local_count, 0)
+
+    append_error_log(error_log_path, f"Repairing incomplete path: {remote_path}")
+    print_notice(
+        f"{Fore.YELLOW}Incomplete: {label}"
+        + (f" ({missing} missing)" if missing else "")
+        + f"{Style.RESET_ALL}"
+    )
+
+    # Full re-pull only when almost nothing landed
+    if local_count is not None and remote_count and local_count < max(remote_count * 0.1, 5):
+        print_notice(f"{Fore.YELLOW}Re-pulling {label}...{Style.RESET_ALL}")
+        parent = os.path.dirname(local_path.rstrip("\\/")) or local_path
+        os.makedirs(parent, exist_ok=True)
+        adb_pull(device_name, remote_path, parent, error_log_path, active_process)
+        complete, _, _ = tree_complete(device_name, remote_path, local_path)
+        if complete:
+            return True
+
+    copied, failed = fill_missing_gaps(
+        device_name, remote_path, local_path, error_log_path,
+        active_process, status_holder
+    )
+    if copied or failed:
+        print_notice(f" - Gap fill: {copied} recovered, {failed} failed")
+    complete, _, _ = tree_complete(device_name, remote_path, local_path)
+    return complete
+
+def perform_backup_with_progress(device_name, source_path, backup_location, total_size, exclude_android):
+    """Execute the backup with per-folder pulls, retries, and verification.
+    
+    Returns: "complete", "incomplete", or "failed"
+    """
+    start_time = time.time()
+    error_log_path = os.path.join(backup_location, "backup_errors.log")
+    active_process = {"proc": None}
+    stop_progress = threading.Event()
+    status_holder = {"label": ""}
+
+    try:
+        result = adb_shell(
+            device_name,
+            f"test -d {shell_quote(source_path)} && echo exists",
+            timeout=5
+        )
+        if "exists" not in result.stdout:
+            print(f"{Fore.RED}Error: Source path {source_path} not found on device{Style.RESET_ALL}")
+            input("Press Enter to exit...")
+            return "failed"
+    except Exception as e:
+        print(f"{Fore.RED}Error verifying source path: {e}{Style.RESET_ALL}")
+        input("Press Enter to exit...")
+        return "failed"
+
+    jobs, pulled_root = build_pull_jobs(
+        device_name, source_path, backup_location, exclude_android
+    )
+    if not jobs:
+        print(f"{Fore.RED}No accessible items to back up under {source_path}{Style.RESET_ALL}")
+        input("Press Enter to exit...")
+        return "failed"
+
+    print("-" * 60)
+    if exclude_android and source_path.rstrip("/") == "/sdcard":
+        print(f"{Fore.CYAN}Full backup: pulling {len(jobs)} top-level items (Android/ skipped){Style.RESET_ALL}")
+    print("")
+
+    def progress_loop():
+        last_size = 0
+        last_update_time = start_time
+        transfer_rate = 0
+        rate_samples = []
+        max_samples = 5
+        while not stop_progress.wait(1.0):
+            current_size, file_count = get_current_backup_size(backup_location, start_time)
+            progress = min((current_size / total_size) * 100, 100.0) if total_size else 0
+            current_time = time.time()
+            time_diff = current_time - last_update_time
             if time_diff >= 1 and current_size >= last_size:
-                size_diff = current_size - last_size
-                instant_rate = size_diff / time_diff
+                instant_rate = (current_size - last_size) / time_diff
                 rate_samples.append(instant_rate)
-                
                 if len(rate_samples) > max_samples:
                     rate_samples.pop(0)
-                
                 transfer_rate = sum(rate_samples) / len(rate_samples)
                 last_size = current_size
                 last_update_time = current_time
 
-
-            progress_bar = draw_progress_bar(progress, width=30)
+            label = status_holder.get("label") or ""
+            label_bit = f" {label}" if label else ""
             status = (
-                f"\r{Fore.CYAN}{progress_bar} "
+                f"{Fore.CYAN}{draw_progress_bar(progress, width=30)} "
                 f"{format_size(current_size)}/{format_size(total_size)} "
                 f"({file_count} files) "
-                f"[{format_size(transfer_rate)}/s]{Style.RESET_ALL}"
+                f"[{format_size(transfer_rate)}/s]{label_bit}{Style.RESET_ALL}"
             )
+            with _CONSOLE_LOCK:
+                print("\r" + " " * 160 + "\r" + status, end="", flush=True)
 
+    progress_thread = threading.Thread(target=progress_loop, daemon=True)
+    progress_thread.start()
 
-            
-            print(status, end='', flush=True)
+    try:
+        any_failure = False
+        for index, (remote_path, local_parent, label) in enumerate(jobs, 1):
+            status_holder["label"] = f"| {index}/{len(jobs)} {label}"
+            append_error_log(error_log_path, f"Pulling {remote_path}")
+            safe_label = sanitize_component(label)
+            local_item = os.path.join(local_parent, safe_label)
+            os.makedirs(local_parent, exist_ok=True)
 
-            if process.poll() is not None:
-                break
+            # Names illegal on Windows: per-file pull with safe paths
+            if safe_label != label:
+                append_error_log(
+                    error_log_path,
+                    f"Windows-unsafe name {label!r} mapped to {safe_label!r}; using per-file pull"
+                )
+                os.makedirs(local_item, exist_ok=True)
+                fill_missing_gaps(
+                    device_name, remote_path, local_item, error_log_path,
+                    active_process, status_holder
+                )
+            else:
+                last_rc = -1
+                for attempt in range(1, _PULL_RETRIES + 1):
+                    last_rc = adb_pull(
+                        device_name, remote_path, local_parent, error_log_path, active_process
+                    )
+                    # Trust ADB exit code during the main pass; verify/repair after
+                    if last_rc == 0 and os.path.exists(local_item):
+                        break
+                    if attempt < _PULL_RETRIES:
+                        time.sleep(1)
+
+            # One completeness check per item (not after every retry)
+            status_holder["label"] = f"| {index}/{len(jobs)} {label} (checking)"
+            complete, remote_cnt, local_cnt = tree_complete(
+                device_name, remote_path, local_item
+            )
+            if not complete:
+                if not repair_tree(
+                    device_name, remote_path, local_item, label,
+                    error_log_path, active_process, status_holder
+                ):
+                    any_failure = True
+            status_holder["label"] = f"| {index}/{len(jobs)} {label}"
+
+        status_holder["label"] = "| verifying"
+        stop_progress.set()
+        progress_thread.join(timeout=2)
+        with _CONSOLE_LOCK:
+            clear_progress_line()
+            print()
 
         current_size, file_count = get_current_backup_size(backup_location, start_time)
-        print()
-        
-        if current_size > 0:
-            end_time = time.time()
-            total_time = end_time - start_time
-            print(f"\n{Fore.GREEN}Backup completed successfully!{Style.RESET_ALL}")
-            
-            if exclude_android:
-                print(f"{Fore.YELLOW}Note: Some protected files in Android folder were skipped{Style.RESET_ALL}")
-            
-            print(f"Summary:")
-            # print(f" - Total files backed up: {file_count} files ({format_size(current_size)})")
-            print(f" - Elapsed time: {format_time(total_time)}")
-            # print(f" - Average speed: {format_size(current_size/total_time)}/s")
-            print(f"{Fore.WHITE} - Backup location: {backup_location}{Style.RESET_ALL}")
-            
-            if os.path.exists(error_log_path) and os.path.getsize(error_log_path) > 0:
-                print(f"{Fore.YELLOW} - Some files were skipped - see backup_errors.log for details{Style.RESET_ALL}")
-            
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            try:
-                with open(os.path.join(backup_location, "backup_completed.txt"), "w") as f:
-                    f.write(f"Backup completed on {timestamp}\n")
-                    f.write(f"Device: {device_name}\n")
-                    f.write(f"Total files: {file_count}\n")
-                    f.write(f"Total size: {format_size(current_size)}\n")
-                    f.write(f"Elapsed time: {format_time(total_time)}\n")
-                    if exclude_android:
-                        f.write(f"Note: Android folder was excluded due to permission restrictions\n")
-            except Exception as e:
-                print(f"{Fore.YELLOW}Warning: Could not create completion file: {e}{Style.RESET_ALL}")
-            
-            print("")
-            input("Backup complete! Press Enter to exit...")
-            return True
-        else:
+        if current_size <= 0:
             print(f"\n{Fore.RED}Backup failed - no files were transferred{Style.RESET_ALL}")
             print("")
             input("Press Enter to exit...")
-            return False
-            
+            return "failed"
+
+        # Final repair for single-folder (partial) backups
+        verify_remote = source_path.rstrip("/") or "/sdcard"
+        if not (exclude_android and verify_remote == "/sdcard"):
+            complete, _, _ = tree_complete(device_name, verify_remote, pulled_root)
+            if not complete:
+                repair_tree(
+                    device_name, verify_remote, pulled_root,
+                    os.path.basename(verify_remote), error_log_path,
+                    active_process, status_holder
+                )
+
+        print(f"\n{Fore.CYAN}Verifying backup completeness...{Style.RESET_ALL}")
+        remote_count = count_remote_files(device_name, source_path, exclude_android)
+        local_count = count_local_files(pulled_root, exclude_android)
+        missing_files = None
+        if remote_count is not None:
+            missing_files = max(remote_count - local_count, 0)
+            print(
+                f" - Device files: {remote_count} | Local files: {local_count}"
+                + (f" | Missing: {missing_files}" if missing_files else "")
+            )
+            if exclude_android:
+                print(f" - (Android/ excluded from comparison)")
+        else:
+            print(f"{Fore.YELLOW} - Could not count device files{Style.RESET_ALL}")
+
+        has_error_log = os.path.exists(error_log_path) and os.path.getsize(error_log_path) > 0
+        if missing_files is not None:
+            incomplete = missing_files > 0
+        else:
+            incomplete = any_failure
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        if incomplete:
+            print(f"\n{Fore.YELLOW}Backup finished with missing or failed files.{Style.RESET_ALL}")
+            if missing_files:
+                print(f"{Fore.YELLOW} - {missing_files} file(s) on device were not found in the backup{Style.RESET_ALL}")
+            if has_error_log:
+                print(f"{Fore.YELLOW} - See backup_errors.log for ADB messages{Style.RESET_ALL}")
+        else:
+            print(f"\n{Fore.GREEN}Backup completed successfully!{Style.RESET_ALL}")
+
+        print(f"Summary:")
+        print(f" - Elapsed time: {format_time(total_time)}")
+        print(f" - Files transferred this run: {file_count} ({format_size(current_size)})")
+        print(f"{Fore.WHITE} - Backup location: {backup_location}{Style.RESET_ALL}")
+        if has_error_log and not incomplete:
+            print(f"{Fore.YELLOW} - ADB reported messages - see backup_errors.log{Style.RESET_ALL}")
+
+        status_name = "backup_incomplete.txt" if incomplete else "backup_completed.txt"
+        other_name = "backup_completed.txt" if incomplete else "backup_incomplete.txt"
+        try:
+            other_path = os.path.join(backup_location, other_name)
+            if os.path.exists(other_path):
+                os.remove(other_path)
+            with open(os.path.join(backup_location, status_name), "w", encoding="utf-8") as f:
+                f.write(f"Backup {'incomplete' if incomplete else 'completed'} on {timestamp}\n")
+                f.write(f"Device: {device_name}\n")
+                f.write(f"Source: {source_path}\n")
+                f.write(f"Files transferred this run: {file_count}\n")
+                f.write(f"Size transferred this run: {format_size(current_size)}\n")
+                f.write(f"Elapsed time: {format_time(total_time)}\n")
+                if remote_count is not None:
+                    f.write(f"Device file count: {remote_count}\n")
+                    f.write(f"Local file count: {local_count}\n")
+                    f.write(f"Missing files: {missing_files}\n")
+                if exclude_android:
+                    f.write("Note: Android/ was skipped intentionally on full backup\n")
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: Could not create status file: {e}{Style.RESET_ALL}")
+
+        print("")
+        prompt = "Backup incomplete. Press Enter to exit..." if incomplete else "Backup complete! Press Enter to exit..."
+        input(prompt)
+        return "incomplete" if incomplete else "complete"
+
     except KeyboardInterrupt:
-        print(f"\n{Fore.YELLOW}Backup interrupted by user.{Style.RESET_ALL}")
-        if process and process.poll() is None:
-            process.terminate()
+        stop_progress.set()
+        print_notice(f"{Fore.YELLOW}Backup interrupted by user.{Style.RESET_ALL}")
+        proc = active_process.get("proc")
+        if proc and proc.poll() is None:
+            proc.terminate()
         print("")
         input("Press Enter to exit...")
-        return False
+        return "failed"
+    finally:
+        stop_progress.set()
 
 def copy_files_from_android(device_name, backup_location, dir_created_by_us):
     """Main backup orchestration function."""
@@ -567,7 +1187,7 @@ def copy_files_from_android(device_name, backup_location, dir_created_by_us):
         
         total_size = estimate_backup_size()
         
-        success = perform_backup_with_progress(
+        result = perform_backup_with_progress(
             device_name,
             source_path,
             backup_location,
@@ -575,7 +1195,8 @@ def copy_files_from_android(device_name, backup_location, dir_created_by_us):
             exclude_android
         )
         
-        if not success and dir_created_by_us:
+        # Only wipe a directory we created when nothing usable was left
+        if result == "failed" and dir_created_by_us:
             cleanup_interrupted_backup(backup_location, dir_created_by_us)
 
     except Exception as e:
@@ -644,7 +1265,7 @@ def load_config():
 
 def main():
     print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
-    print(f"{Fore.GREEN}{'Android Archiver v1.4 (github/mirbyte)':^60}{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}{'Android Archiver v1.5 BETA (github/mirbyte)':^60}{Style.RESET_ALL}")
     print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
 
     try:
