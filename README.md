@@ -8,18 +8,22 @@ Fast and reliable Android device backup tool for Windows. Transfer files from yo
 ## Features
 
 ### Core Functionality
-- **Full or Partial Backups** - Backup entire `/sdcard` or select specific folders
+- **Full or Partial Backups** - Full `/sdcard` (skips `Android/`) or a selected top-level folder
+- **Per-folder ADB pulls** - Full backup pulls each top-level item separately instead of one giant `/sdcard` pull
 - **Fast Transfer** - Uses ADB protocol for faster speeds than MTP
-- **Real-time Progress** - Live transfer rate, progress bar, and ETA
+- **Real-time Progress** - Live transfer rate, progress bar, file count, and current folder
+- **Completeness verification** - Compares device vs local file counts after transfer
+- **Gap fill / repair** - Re-pulls incomplete subdirectories; streams problem filenames via `adb exec-out`
 - **Smart Existing Backup Handling** - Merge, replace, or cancel when files already exist
 - **Safe Operation** - Critical system directory protection and confirmation prompts
 
 ### Safety Features
 - Prevents backup to critical system directories
 - Disk space checking with warnings
-- Safe cleanup on interruption (only if directory was created by the tool)
+- Safe cleanup on hard failure (only if the directory was created by the tool and nothing usable transferred)
+- Incomplete backups are kept (not deleted) and marked with `backup_incomplete.txt`
 - Network drive detection and performance warnings
-- Automatic USB debugging verification
+- Automatic USB debugging verification / ADB server restart
 
 ## Requirements
 
@@ -63,16 +67,17 @@ Fast and reliable Android device backup tool for Windows. Transfer files from yo
 3. Choose backup location (default: `Documents/AndroidBackup`)
 4. If location already has files, choose to merge, replace, or cancel
 5. Select backup type:
-   - **Option 1**: Full backup (entire `/sdcard`)
+   - **Option 1**: Full backup (entire `/sdcard`, excludes `Android/` folder)
    - **Option 2**: Partial backup (select specific folder)
-6. Enter estimated backup size in GB
+6. Enter estimated backup size in GB (used for the progress bar only)
 7. Wait for transfer to complete
+8. Review verification output (device vs local file counts). Check `backup_errors.log` if anything was skipped or repaired.
 
 ### Example Output
 
 ```
 ============================================================
-           Android Archiver v1.2 (github/mirbyte)          
+        Android Archiver v1.5 BETA (github/mirbyte)        
 ============================================================
 ADB Version: 35.0.1
 
@@ -88,7 +93,15 @@ Default: C:\Users\YourName\Documents\AndroidBackup
 
 Press Enter to use default, or type a custom path: 
 
-[████████████████████████░░░░░░] 82.3% 24.5 GB/29.8 GB [156.2 MB/s] ETA: 00:00:34
+Full backup: pulling 15 top-level items (Android/ skipped)
+
+[███████░░░░░░░░░░░░░░░░░░░░░░░] 23.4% 56.12 GB/240.00 GB (3950 files) [120.5 MB/s] | 4/15 Download
+
+Verifying backup completeness...
+ - Device files: 12040 | Local files: 12040
+ - (Android/ excluded from comparison)
+
+Backup completed successfully!
 ```
 
 ## Platform Tools
@@ -106,10 +119,13 @@ The application creates a config file `android_archiver.cfg` on first run. You c
 backup_location = C:\Users\YourName\Documents\AndroidBackup
 ```
 
-Environment variables are supported:
+Environment variables are supported using Windows `%VAR%` syntax (expanded with `os.path.expandvars`):
+
 ```ini
 backup_location = %USERPROFILE%\Documents\AndroidBackup
 ```
+
+Note: `${USERPROFILE}` style placeholders are **not** expanded on Windows. Use `%USERPROFILE%`.
 
 ## Troubleshooting
 
@@ -126,25 +142,37 @@ backup_location = %USERPROFILE%\Documents\AndroidBackup
 - Close other applications using the device
 - Avoid network drives as backup destinations
 - Check if antivirus is scanning files during transfer
+- Gap-fill / per-file streaming of problem names is slower than bulk `adb pull`
+
+### Incomplete Backup / Missing Files
+
+- Read `backup_errors.log` and `backup_incomplete.txt` in the backup folder
+- Filenames illegal on Windows (`? : * " < > |`) are streamed via `adb exec-out` into sanitized local names
+- Re-run with **merge** to fill gaps, or use a partial backup of just `Download`
+- Very long paths may still fail even with extended-path handling
 
 ### Permission Errors
 
 - Run as administrator if backing up to protected locations
 - Ensure the backup location isn't a system directory
+- Protected paths under `Android/` are skipped on full backup by design
 
 ## Technical Details
 
 - **Language**: Python 3.x (compiled to Windows executable)
-- **ADB Version**: Latest as of 10.2.2026 (DD.MM.YYYY)
-- **Transfer Method**: ADB pull protocol
-- **Progress Tracking**: Moving average over 5 samples for smooth rate display
+- **Version**: 1.5 BETA
+- **Transfer Method**: Per-folder `adb pull`, with subdirectory gap-fill and `adb exec-out cat` fallback for problematic files
+- **Progress Tracking**: Destination size sampling with a moving average over 5 samples (progress % depends on your size estimate)
+- **Verification**: Device `find` file count vs local file count (`Android/` excluded for full backups)
 
 ## Known Issues
 
-- Progress bar and speed calculation sometimes works sometimes not
+- Progress % depends on the manual GB estimate; a bad guess makes the bar misleading (speed/file count are still useful)
+- Progress bar and speed can stall during verification or gap-fill (device `find` / subdirectory re-pulls)
 - File modification times may not be preserved exactly
-- Some system files may be skipped due to Android permissions
+- Some files may still be skipped due to Android permissions or unreadable paths
 - Very large transfers (100GB+) may take several hours
+- Windows MAX_PATH and odd OEM storage layouts can still leave gaps; check verification counts
 
 
 ## Disclaimer
@@ -164,6 +192,3 @@ The author of this software is not responsible for any data loss, device damage,
 **Repository**: [github.com/mirbyte/Android-Archiver](https://github.com/mirbyte/Android-Archiver)
 
 If you found this project useful, please consider giving a ⭐ !
-
-
-
