@@ -1275,7 +1275,7 @@ def load_config():
 
 def main():
     print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
-    print(f"{Fore.GREEN}{'Android Archiver v1.5 BETA (github/mirbyte)':^60}{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}{'Android Archiver v1.6 (github/mirbyte)':^60}{Style.RESET_ALL}")
     print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
 
     try:
