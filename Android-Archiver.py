@@ -449,7 +449,8 @@ def get_current_backup_size(backup_location, backup_start_time):
 
 def count_remote_files(device_name, source_path, exclude_android=False):
     """Count regular files under source_path on the device. Returns int or None."""
-    quoted = shell_quote(source_path)
+    # Trailing slash makes find follow /sdcard, which is a symlink on Android
+    quoted = shell_quote(source_path.rstrip("/") + "/")
     if exclude_android:
         find_expr = f"find {quoted} -type f ! -path '*/Android/*' 2>/dev/null | wc -l"
     else:
@@ -486,7 +487,7 @@ def list_remote_entries(device_name, remote_dir):
     try:
         result = adb_shell(
             device_name,
-            f"ls -1 {shell_quote(remote_dir)}",
+            f"ls -1A {shell_quote(remote_dir)}",
             timeout=60
         )
         return [
@@ -497,12 +498,12 @@ def list_remote_entries(device_name, remote_dir):
     except Exception:
         return []
 
-def list_remote_files(device_name, remote_dir):
-    """List all file paths under remote_dir on the device."""
+def list_remote_files(device_name, remote_dir, find_type="f"):
+    """List all paths of find_type ("f" files, "d" directories) under remote_dir on the device."""
     try:
         result = adb_shell(
             device_name,
-            f"find {shell_quote(remote_dir)} -type f 2>/dev/null",
+            f"find {shell_quote(remote_dir)} -type {find_type} 2>/dev/null",
             timeout=300
         )
         return [
@@ -549,7 +550,9 @@ def ensure_extended_path(path):
     return "\\\\?\\" + abs_path
 
 def remote_path_needs_stream(remote_path):
-    """True if any remote path component is illegal/problematic for Windows adb pull."""
+    """True if the remote path is non-ASCII or has a component problematic for Windows adb pull."""
+    if not remote_path.isascii():
+        return True
     for part in remote_path.replace("\\", "/").split("/"):
         if not part:
             continue
@@ -788,7 +791,7 @@ def pull_file_list(
             if use_stream:
                 append_error_log(
                     error_log_path,
-                    f"Streaming (illegal Windows name): {remote_file}"
+                    f"Streaming (non-ASCII or illegal name): {remote_file}"
                 )
             else:
                 append_error_log(
@@ -811,6 +814,42 @@ def pull_file_list(
             append_error_log(error_log_path, f"Failed to copy file: {remote_file}")
     return copied, failed
 
+def pull_split_tree(device_name, remote_dir, local_dir, error_log_path, active_process=None, status_holder=None):
+    """Pull remote_dir into local_dir. adb mangles non-ASCII folder names on Windows, so files under
+    them are streamed per file while ASCII subfolders are still pulled with adb."""
+    label = os.path.basename(remote_dir)
+    if not remote_dir.isascii():
+        pairs = [
+            (f, remote_to_local_file(f, remote_dir, local_dir))
+            for f in list_remote_files(device_name, remote_dir)
+        ]
+        pull_file_list(device_name, pairs, error_log_path, active_process, status_holder, label=label)
+        return
+
+    dirs = set(list_remote_files(device_name, remote_dir, "d"))
+    if all(d.isascii() for d in dirs):
+        for attempt in range(1, _PULL_RETRIES + 1):
+            rc = adb_pull(device_name, remote_dir, os.path.dirname(local_dir), error_log_path, active_process)
+            if rc == 0 and os.path.exists(local_dir):
+                return
+            if attempt < _PULL_RETRIES:
+                time.sleep(1)
+        return
+
+    os.makedirs(local_dir, exist_ok=True)
+    for d in dirs:
+        if d.rsplit("/", 1)[0] == remote_dir:
+            pull_split_tree(
+                device_name, d, os.path.join(local_dir, sanitize_component(os.path.basename(d))),
+                error_log_path, active_process, status_holder
+            )
+    pairs = [
+        (f, remote_to_local_file(f, remote_dir, local_dir))
+        for f in list_remote_files(device_name, remote_dir)
+        if f.rsplit("/", 1)[0] == remote_dir
+    ]
+    pull_file_list(device_name, pairs, error_log_path, active_process, status_holder, label=label)
+
 def fill_missing_gaps(
     device_name, remote_dir, local_dir, error_log_path,
     active_process=None, status_holder=None, depth=0
@@ -829,7 +868,7 @@ def fill_missing_gaps(
         f"{len(missing)} missing{Style.RESET_ALL}"
     )
 
-    if len(missing) <= _MAX_INDIVIDUAL_PULLS or depth >= _MAX_GAP_DEPTH:
+    if len(missing) <= _MAX_INDIVIDUAL_PULLS or depth >= _MAX_GAP_DEPTH or not remote_dir.isascii():
         return pull_file_list(
             device_name, missing, error_log_path,
             active_process, status_holder, label="fill"
@@ -848,14 +887,15 @@ def fill_missing_gaps(
             status_holder["label"] = (
                 f"| gap dir {idx}/{len(child_items)} {child_name}"
             )
-        print_notice(
-            f"{Fore.YELLOW}Re-pulling subdirectory: {child_name} "
-            f"({len(child_missing)} missing){Style.RESET_ALL}"
-        )
-        append_error_log(error_log_path, f"Gap-fill subdirectory pull: {remote_child}")
-        adb_pull(
-            device_name, remote_child, local_dir, error_log_path, active_process
-        )
+        if remote_child.isascii():
+            print_notice(
+                f"{Fore.YELLOW}Re-pulling subdirectory: {child_name} "
+                f"({len(child_missing)} missing){Style.RESET_ALL}"
+            )
+            append_error_log(error_log_path, f"Gap-fill subdirectory pull: {remote_child}")
+            pull_split_tree(
+                device_name, remote_child, local_child, error_log_path, active_process, status_holder
+            )
 
         still = [
             (r, l) for r, l in child_missing
@@ -881,33 +921,12 @@ def fill_missing_gaps(
             failed += f
 
     if root_files:
-        if len(root_files) <= _MAX_INDIVIDUAL_PULLS or depth >= _MAX_GAP_DEPTH:
-            c, f = pull_file_list(
-                device_name, root_files, error_log_path,
-                active_process, status_holder, label="root"
-            )
-            copied += c
-            failed += f
-        else:
-            # Too many loose root files: one more parent pull then small leftovers
-            parent = os.path.dirname(local_dir.rstrip("\\/")) or local_dir
-            adb_pull(device_name, remote_dir, parent, error_log_path, active_process)
-            still = [
-                (r, l) for r, l in root_files
-                if not local_file_ok(l)
-            ]
-            if still:
-                c, f = pull_file_list(
-                    device_name, still[:_MAX_INDIVIDUAL_PULLS], error_log_path,
-                    active_process, status_holder, label="root"
-                )
-                copied += c
-                failed += f + max(0, len(still) - _MAX_INDIVIDUAL_PULLS)
-                for r, _ in still[_MAX_INDIVIDUAL_PULLS:]:
-                    append_error_log(
-                        error_log_path,
-                        f"Skipped after gap-fill limit: {r}"
-                    )
+        c, f = pull_file_list(
+            device_name, root_files, error_log_path,
+            active_process, status_holder, label="root"
+        )
+        copied += c
+        failed += f
 
     return copied, failed
 
@@ -934,9 +953,7 @@ def repair_tree(
     # Full re-pull only when almost nothing landed
     if local_count is not None and remote_count and local_count < max(remote_count * 0.1, 5):
         print_notice(f"{Fore.YELLOW}Re-pulling {label}...{Style.RESET_ALL}")
-        parent = os.path.dirname(local_path.rstrip("\\/")) or local_path
-        os.makedirs(parent, exist_ok=True)
-        adb_pull(device_name, remote_path, parent, error_log_path, active_process)
+        pull_split_tree(device_name, remote_path, local_path, error_log_path, active_process, status_holder)
         complete, _, _ = tree_complete(device_name, remote_path, local_path)
         if complete:
             return True
@@ -1044,16 +1061,9 @@ def perform_backup_with_progress(device_name, source_path, backup_location, tota
                     active_process, status_holder
                 )
             else:
-                last_rc = -1
-                for attempt in range(1, _PULL_RETRIES + 1):
-                    last_rc = adb_pull(
-                        device_name, remote_path, local_parent, error_log_path, active_process
-                    )
-                    # Trust ADB exit code during the main pass; verify/repair after
-                    if last_rc == 0 and os.path.exists(local_item):
-                        break
-                    if attempt < _PULL_RETRIES:
-                        time.sleep(1)
+                pull_split_tree(
+                    device_name, remote_path, local_item, error_log_path, active_process, status_holder
+                )
 
             # One completeness check per item (not after every retry)
             status_holder["label"] = f"| {index}/{len(jobs)} {label} (checking)"
